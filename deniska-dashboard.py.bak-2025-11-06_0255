@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, json, time, psutil, socket, threading, subprocess, shlex
+from datetime import datetime
+from flask import Flask, Response, request, jsonify, stream_with_context, render_template_string, abort
+
+# ---- Конфиг -----------------------------------------------------------------
+PORT = int(os.getenv("DENISKA_DASH_PORT", "18081"))
+HOST = "0.0.0.0"
+MAP_FILE = "/root/secrets/deniska-map.json"         # { "jurist": "user/repo", ... }  (или любая строка в колонке GitHub)
+SYNC_BIN = "/usr/local/bin/deniska-sync.sh"
+COMPOSE_BIN = "/usr/local/bin/deniska-compose.sh"
+REMOTE_ENV = "/root/secrets/deniska-remote.env"     # TG_BOT=..., TG_CHAT=...
+SERVER_NAME = socket.gethostname()
+
+app = Flask(__name__)
+
+# ---- Утилиты ----------------------------------------------------------------
+def load_map():
+    try:
+        with open(MAP_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def load_env_vars(path):
+    res = {}
+    if not os.path.exists(path):
+        return res
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                res[k.strip()] = v.strip().strip('"').strip("'")
+    return res
+
+TG = load_env_vars(REMOTE_ENV)
+
+def run(cmd, timeout=None, check=False):
+    """shell one-liner, stdout text"""
+    p = subprocess.run(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, timeout=timeout
+    )
+    if check and p.returncode != 0:
+        raise RuntimeError(p.stdout)
+    return p.stdout
+
+def sysd_active(unit):
+    code = subprocess.call(["systemctl", "is-active", "--quiet", unit])
+    if code == 0:
+        return "active"
+    if code == 3:
+        return "inactive"
+    return "not-found"
+
+def human_uptime():
+    boot = datetime.fromtimestamp(psutil.boot_time())
+    delta = datetime.now() - boot
+    d = delta.days
+    h = delta.seconds // 3600
+    m = (delta.seconds % 3600) // 60
+    return f"{d}d {h}h {m}m"
+
+def tg_notify(text: str):
+    bot = TG.get("TG_BOT", "")
+    chat = TG.get("TG_CHAT", "")
+    if not bot or not chat:
+        return
+    try:
+        # без внешних зависимостей
+        run(f'curl -s -X POST "https://api.telegram.org/bot{bot}/sendMessage" -d "chat_id={chat}" -d "text={text}"')
+    except Exception:
+        pass
+
+# ---- Метрики ----------------------------------------------------------------
+_metrics_ring = {"cpu": [], "ram": []}
+_RING_MAX = 180  # 3 минуты по 1 точке/сек
+
+def metrics_tick():
+    while True:
+        try:
+            cpu = psutil.cpu_percent(interval=1.0)
+            ram = psutil.virtual_memory().percent
+            for key, val in (("cpu", cpu), ("ram", ram)):
+                arr = _metrics_ring[key]
+                arr.append(round(val, 1))
+                if len(arr) > _RING_MAX:
+                    del arr[: len(arr) - _RING_MAX]
+        except Exception:
+            time.sleep(1)
+
+threading.Thread(target=metrics_tick, daemon=True).start()
+
+@app.get("/metrics")
+def metrics_json():
+    cpu = _metrics_ring["cpu"][-1] if _metrics_ring["cpu"] else psutil.cpu_percent()
+    ram = _metrics_ring["ram"][-1] if _metrics_ring["ram"] else psutil.virtual_memory().percent
+    return jsonify({"cpu": cpu, "ram": ram, "uptime": human_uptime()})
+
+@app.get("/metrics/series")
+def metrics_series():
+    return jsonify({"cpu": _metrics_ring["cpu"], "ram": _metrics_ring["ram"], "uptime": human_uptime()})
+
+# ---- Данные/статусы ---------------------------------------------------------
+def projects_table():
+    data = load_map()
+    rows = []
+    # допускаем формат: { "jurist": "user/jurist-autosave.git", "persobi": "user/persobi-content.git", ... }
+    for name, repo in data.items():
+        unit = f"{name}.service"
+        status = sysd_active(unit)
+        # репо-строка может быть URL/путь/любая подпись — печатаем как есть, а ссылку строим если похоже на GitHub
+        repo_str = str(repo)
+        gh = repo_str
+        if repo_str and "github.com" not in repo_str and "/" in repo_str:
+            gh = f"https://github.com/{repo_str}"
+        rows.append({"name": name, "repo_str": repo_str, "repo_link": gh, "unit": unit, "status": status})
+    return rows
+
+@app.get("/api/services")
+def api_services():
+    return jsonify({"server": SERVER_NAME, "at": datetime.now().isoformat(), "rows": projects_table()})
+
+@app.get("/api/ping")
+def api_ping():
+    out = {}
+    for row in projects_table():
+        out[row["name"]] = sysd_active(row["unit"])
+    return jsonify({"server": SERVER_NAME, "ping": out, "at": datetime.now().isoformat()})
+
+# ---- Действия: Sync / Compose / Restart ------------------------------------
+@app.post("/sync/<project>")
+def sync_project(project):
+    if not os.path.exists(SYNC_BIN):
+        return jsonify({"ok": False, "msg": "sync tool not found"}), 500
+    env = f". {REMOTE_ENV}; " if os.path.exists(REMOTE_ENV) else ""
+    out = run(f'{env}{shlex.quote(SYNC_BIN)} 2>&1')
+    return jsonify({"ok": True, "msg": out})
+
+@app.post("/compose")
+def compose():
+    payload = request.get_json(force=True, silent=True) or {}
+    name = (payload.get("name") or "").strip()
+    sources_str = (payload.get("sources") or "").strip()
+    if not name or not sources_str:
+        return jsonify({"ok": False, "msg": "name & sources required"}), 400
+    if not os.path.exists(COMPOSE_BIN):
+        return jsonify({"ok": False, "msg": "compose tool not found"}), 500
+    cmd = f'{shlex.quote(COMPOSE_BIN)} {shlex.quote(name)} {sources_str}'
+    out = run(cmd)
+    tg_notify(f"✅ Новый бот {name} создан (сборка: {sources_str})")
+    return jsonify({"ok": True, "msg": out})
+
+@app.post("/api/restart/<unit>")
+def api_restart(unit):
+    unit = unit.strip()
+    if "/" in unit or ".." in unit:
+        abort(400)
+    try:
+        run(f"systemctl restart {shlex.quote(unit)}", check=True)
+        time.sleep(0.7)
+        st = sysd_active(unit)
+        tg_notify(f"🔁 Restart {unit} → {st}")
+        return jsonify({"ok": True, "status": st})
+    except Exception as e:
+        tg_notify(f"❌ Restart error: {unit}")
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
+# ---- Логи: статические и live SSE ------------------------------------------
+@app.get("/logs/<unit>")
+def logs_tail(unit):
+    unit = unit.strip()
+    out = run(f'journalctl -u {shlex.quote(unit)} -n 300 --no-pager 2>&1')
+    return Response(f"<pre style='color:#e8ecf1;background:#0b0f14;padding:16px'>{out}</pre>",
+                    mimetype="text/html; charset=utf-8")
+
+@app.get("/logs/stream/<unit>")
+def logs_stream(unit):
+    unit = unit.strip()
+    def generate():
+        p = subprocess.Popen(
+            ["journalctl", "-u", unit, "-f", "-n", "0", "-o", "short"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+        try:
+            for line in iter(p.stdout.readline, ''):
+                yield f"data: {line.rstrip()}\n\n"
+        finally:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+    headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
+    return Response(stream_with_context(generate()), headers=headers)
+
+# ---- HTML -------------------------------------------------------------------
+TEMPLATE = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>Deniska Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --bg:#0c0e12;--card:#12161c;--text:#e8ecf1;--muted:#9aa4b2;
+  --ok:#19c37d;--warn:#e6a700;--btn:#1f2531;--btnText:#c8d0dc;--border:#222a35;
+}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial}
+.wrap{max-width:1200px;margin:28px auto;padding:0 16px}
+.hdr{display:flex;align-items:center;gap:14px}
+.logo{font-size:28px}
+.badge{padding:2px 8px;border-radius:10px;background:#0e1218;color:var(--muted);border:1px solid var(--border)}
+.grid{margin-top:22px;border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.row{display:grid;grid-template-columns:220px 1fr 220px 220px 320px;background:var(--card);border-bottom:1px solid var(--border)}
+.row.h{background:#0f1319;color:#aeb7c3;font-weight:600}
+.cell{padding:14px 16px;border-right:1px solid var(--border)}
+.cell:last-child{border-right:none}
+a{color:#88aaff;text-decoration:none}
+.kit{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.btn{padding:7px 12px;border-radius:10px;background:var(--btn);color:var(--btnText);border:1px solid var(--border);cursor:pointer}
+.btn:hover{filter:brightness(1.2)}
+.dot{width:10px;height:10px;border-radius:50%}
+.ok{background:var(--ok)}.warn{background:var(--warn)}
+.foot{margin-top:18px;padding:16px;border:1px solid var(--border);border-radius:12px;background:var(--card)}
+.inp{width:100%;padding:10px;border-radius:10px;background:#0b0f14;border:1px solid var(--border);color:var(--text)}
+.spark{height:14px;width:540px;display:flex;gap:2px;align-items:flex-end}
+.bar{width:3px;background:#3b82f6}
+.tag{padding:2px 8px;border-radius:10px;border:1px solid var(--border);color:var(--muted)}
+</style>
+<script>
+async function api(path, body=null){
+  const opt = body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
+  const r = await fetch(path,opt); if(!r.ok){throw new Error(await r.text())}; return await r.json();
+}
+async function ping(){
+  try{
+    const r=await fetch('/metrics'); const m=await r.json();
+    document.getElementById('cpu').innerText = (m.cpu||0).toFixed ? m.cpu.toFixed(0)+'%' : m.cpu+'%';
+    document.getElementById('ram').innerText = (m.ram||0).toFixed ? m.ram.toFixed(1)+'%' : m.ram+'%';
+    document.getElementById('uptime').innerText = m.uptime || '';
+  }catch(e){}
+}
+async function series(){
+  try{
+    const r=await fetch('/metrics/series'); const s=await r.json();
+    const cont = document.getElementById('spark'); cont.innerHTML='';
+    (s.cpu||[]).slice(-140).forEach(v=>{
+      const b=document.createElement('div'); b.className='bar'; b.style.height = (4+v)+'px'; cont.appendChild(b);
+    });
+  }catch(e){}
+}
+async function doSync(p){const b=document.getElementById('btn-sync-'+p); b.innerText='…'; b.disabled=true;
+  try{await api('/sync/'+p,{}); b.innerText='Sync';}catch(e){b.innerText='Sync'} b.disabled=false;
+}
+async function doRestart(svc){const b=document.getElementById('btn-restart-'+svc); b.innerText='…'; b.disabled=true;
+  try{const r=await api('/api/restart/'+svc,{}); b.innerText='Restart'; alert('Status: '+(r.status||'unknown'));}catch(e){b.innerText='Restart'; alert('Error: '+e.message)} b.disabled=false;
+}
+async function compose(){
+  const name=document.getElementById('newbot').value.trim();
+  const src=document.getElementById('from').value.trim();
+  if(!name || !src){alert('name & sources');return}
+  const btn=document.getElementById('compose'); btn.innerText='…'; btn.disabled=true;
+  try{
+    const r = await api('/compose',{name:name, sources:src});
+    alert((r.msg||'ok').slice(-2000));
+  }catch(e){alert('Error: '+e.message)}
+  btn.innerText='Compose'; btn.disabled=false;
+}
+setInterval(()=>{ping()},3000); setInterval(()=>{series()},5000);
+window.addEventListener('load',()=>{ping();series();});
+</script>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <div class="logo">🧩 Deniska Dashboard</div>
+    <div class="badge">Сервер: {{server}} | Обновлено: {{now}}</div>
+    <div class="badge">| CPU: <span id="cpu">…%</span>  RAM: <span id="ram">…%</span>  Uptime: <span id="uptime">…</span></div>
+    <div class="spark" id="spark"></div>
+    <button class="btn" onclick="ping()">Ping</button>
+  </div>
+
+  <div class="grid">
+    <div class="row h">
+      <div class="cell">Проект</div>
+      <div class="cell">GitHub</div>
+      <div class="cell">Сервис</div>
+      <div class="cell">Статус</div>
+      <div class="cell">Действия</div>
+    </div>
+    {% for it in items %}
+    <div class="row">
+      <div class="cell">{{it.name}}</div>
+      <div class="cell"><a href="{{it.repo_link}}" target="_blank">{{it.repo_str}}</a></div>
+      <div class="cell">{{it.unit}}</div>
+      <div class="cell kit">
+        <div class="dot {{'ok' if it.status=='active' else 'warn'}}"></div>
+        <div>{{ 'Active' if it.status=='active' else 'not found' }}</div>
+      </div>
+      <div class="cell kit">
+        <button class="btn" id="btn-sync-{{it.name}}" onclick="doSync('{{it.name}}')">Sync</button>
+        <a class="btn" href="/logs/{{it.unit}}" target="_blank">Logs</a>
+        <a class="btn" href="/logs/stream/{{it.unit}}" target="_blank">Live</a>
+        <button class="btn" id="btn-restart-{{it.unit}}" onclick="doRestart('{{it.unit}}')">Restart</button>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="foot">
+    <div style="font-weight:700;margin-bottom:8px">Создать нового бота</div>
+    <div class="kit" style="gap:12px">
+      <input id="newbot" class="inp" placeholder="новый бот">
+      <input id="from" class="inp" placeholder="через пробел: jurist persobi">
+      <button id="compose" class="btn" onclick="compose()">Compose</button>
+      <span class="tag">TG notify: {{ 'on' if tg_on else 'off' }}</span>
+    </div>
+  </div>
+</div>
+</body></html>
+"""
+
+@app.get("/")
+def index():
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return render_template_string(
+        TEMPLATE,
+        server=SERVER_NAME,
+        now=now,
+        items=projects_table(),
+        tg_on=bool(TG.get("TG_BOT") and TG.get("TG_CHAT"))
+    )
+
+# ---- run --------------------------------------------------------------------
+if __name__ == "__main__":
+    app.run(host=HOST, port=PORT, debug=False)
