@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, json, subprocess, shlex, html
+import os, json, subprocess, shlex, html, mimetypes
 from pathlib import Path
-from flask import Flask, Response, jsonify, request
+from datetime import datetime
+from flask import Flask, Response, jsonify, request, send_file
 
 app = Flask(__name__)
 
+# Карта известных репозиториев/проектов (расширяемая)
 REPOS = [
-    {"name": "jurist",   "unit": "jurist.service",             "path": "/root/projects/jurist"},
-    {"name": "persobi",  "unit": "persobi.service",            "path": "/root/projects/persobi-content"},
-    {"name": "deniska",  "unit": "deniska-dashboard.service",  "path": "/root/projects/deniska-dashboard"},
-    {"name": "testbot",  "unit": "testbot.service",            "path": "/root/projects/testbot"},
+    {"name": "jurist",   "unit": "jurist.service",            "path": "/root/projects/jurist"},
+    {"name": "persobi",  "unit": "persobi.service",           "path": "/root/projects/persobi-content"},
+    {"name": "deniska",  "unit": "deniska-dashboard.service", "path": "/root/projects/deniska-dashboard"},
+    {"name": "testbot",  "unit": "testbot.service",           "path": "/root/projects/testbot"},
 ]
 
 PASSPORT_FILE = "/root/docs/DENISKA_PASSPORT.md"
@@ -32,14 +34,15 @@ def read_state_files():
         try:
             if state_path.exists():
                 data = json.loads(state_path.read_text(encoding="utf-8"))
-                item.update({k: data.get(k, item.get(k)) for k in ["status","branch","origin","dirty"]})
+                for k in ["status", "branch", "origin", "dirty"]:
+                    item[k] = data.get(k, item[k])
         except Exception:
             pass
         rows.append(item)
     return rows
 
 def collect_status_quick():
-    """Пытаемся взять готовый JSON скриптом; если не вышло — читаем STATE.json в репо."""
+    # Пытаемся взять готовый JSON от скрипта, иначе — STATE.json
     try:
         cp = run("bash /root/bin/deniska-status.sh", timeout=3.0)
         if cp.returncode == 0:
@@ -50,13 +53,16 @@ def collect_status_quick():
             for r in REPOS:
                 base = {"name": r["name"], "unit": r["unit"], "path": r["path"],
                         "status": "unknown", "branch": "-", "origin": "-", "dirty": "-"}
-                base.update(byname.get(r["name"], {}))
+                upd = byname.get(r["name"]) or {}
+                for k, v in upd.items():
+                    base[k] = v
                 out.append(base)
             return out
     except Exception:
         pass
     return read_state_files()
 
+# ---------- Базовые эндпойнты ----------
 @app.route("/ping")
 def ping():
     return _no_store(jsonify({"ok": True}))
@@ -64,17 +70,22 @@ def ping():
 @app.route("/api/services")
 def api_services():
     rows = collect_status_quick()
-    return _no_store(jsonify({"rows": rows}))
+    resp = jsonify({"rows": rows})
+    return _no_store(resp)
 
 @app.route("/logs")
 def logs():
     unit = request.args.get("unit", "deniska-dashboard.service")
     try:
         cp = run(f"journalctl -u {shlex.quote(unit)} -n 200 --no-pager", timeout=3.5)
-        body = html.escape(cp.stdout[-10000:] if cp.stdout else cp.stderr)
+        body = cp.stdout[-10000:] if cp.stdout else cp.stderr
+        body = html.escape(body)
     except Exception as e:
-        body = f"error: {html.escape(str(e))}"
-    html_page = f"<pre style='background:#0b0f14;color:#e5e7eb;padding:16px;white-space:pre-wrap'>{body}</pre>"
+        body = "error: " + html.escape(str(e))
+    html_page = (
+        "<pre style='background:#111;color:#eee;padding:16px;white-space:pre-wrap'>"
+        + body + "</pre>"
+    )
     return Response(html_page, mimetype="text/html")
 
 @app.route("/restart")
@@ -94,127 +105,232 @@ def docs():
         text = "Паспорт не найден: " + PASSPORT_FILE
     text = html.escape(text)
     html_page = (
-        "<html><head><meta charset='utf-8'/>"
-        "<style>"
-        ":root{--bg:#0b0f14;--txt:#e5e7eb}"
-        "html,body{background:var(--bg);color:var(--txt);margin:0;"
-        "font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif}"
-        "pre,code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}"
-        "body{padding:20px;white-space:pre-wrap}"
-        "a{color:#93c5fd}"
-        "</style></head><body>" + text + "</body></html>"
+        "<html><body style='background:#111;color:#eee;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;"
+        "padding:20px;white-space:pre-wrap;'>" + text + "</body></html>"
     )
     return Response(html_page, mimetype="text/html")
 
-INDEX_HTML = r"""<!doctype html>
+# ---------- NANO: индекс, просмотр, страница ----------
+def list_nano_for_project(project_path: str):
+    base = Path(project_path) / "docs" / "NANO"
+    files = []
+    if base.exists() and base.is_dir():
+        for p in sorted(base.rglob("*")):
+            if p.is_file():
+                rel = p.relative_to(base).as_posix()
+                try:
+                    st = p.stat()
+                    files.append({
+                        "name": p.name,
+                        "relpath": rel,
+                        "size": st.st_size,
+                        "mtime": int(st.st_mtime),
+                    })
+                except Exception:
+                    files.append({"name": p.name, "relpath": rel, "size": 0, "mtime": 0})
+    return files
+
+@app.route("/nano_index")
+def nano_index():
+    out = []
+    for r in REPOS:
+        out.append({
+            "project": r["name"],
+            "path": r["path"],
+            "items": list_nano_for_project(r["path"])
+        })
+    return _no_store(jsonify({"at": datetime.now().isoformat(), "projects": out}))
+
+def safe_join(base: Path, rel: str) -> Path:
+    # Безопасное соединение с проверкой выхода из каталога
+    relp = Path(rel)
+    cand = (base / relp).resolve()
+    if str(cand).startswith(str(base.resolve())):
+        return cand
+    raise ValueError("bad path")
+
+@app.route("/nano_view")
+def nano_view():
+    project = request.args.get("project", "")
+    rel = request.args.get("path", "")
+    proj = next((r for r in REPOS if r["name"] == project), None)
+    if not proj:
+        return Response("project not found", status=404)
+    base = Path(proj["path"]) / "docs" / "NANO"
+    try:
+        target = safe_join(base, rel)
+        if not target.exists() or not target.is_file():
+            return Response("file not found", status=404)
+        text = target.read_text(encoding="utf-8", errors="replace")
+        esc = html.escape(text)
+        title = html.escape(f"{project} — {rel}")
+        page = (
+            "<html><head><meta charset='utf-8'/>"
+            "<title>" + title + "</title>"
+            "<style>"
+            "body{background:#111;color:#eee;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}"
+            ".top{display:flex;gap:12px;padding:14px;background:#1b1b1b;position:sticky;top:0;border-bottom:1px solid #333}"
+            ".btn{background:#2a2a2a;border:1px solid #3a3a3a;border-radius:10px;padding:8px 14px;text-decoration:none;color:#eee}"
+            ".btn:hover{background:#333}"
+            "pre{padding:16px;margin:0;white-space:pre-wrap}"
+            "</style></head><body>"
+            "<div class='top'>"
+            "<a class='btn' href='/nano'>← NANO</a>"
+            "<a class='btn' href='/nano_raw?project="+ html.escape(project) +"&path="+ html.escape(rel) +"' target='_blank'>⬇ raw</a>"
+            "</div>"
+            "<pre>" + esc + "</pre>"
+            "</body></html>"
+        )
+        return Response(page, mimetype="text/html")
+    except Exception as e:
+        return Response("error: " + html.escape(str(e)), status=500)
+
+@app.route("/nano_raw")
+def nano_raw():
+    project = request.args.get("project", "")
+    rel = request.args.get("path", "")
+    proj = next((r for r in REPOS if r["name"] == project), None)
+    if not proj:
+        return Response("project not found", status=404)
+    base = Path(proj["path"]) / "docs" / "NANO"
+    try:
+        target = safe_join(base, rel)
+        if not target.exists() or not target.is_file():
+            return Response("file not found", status=404)
+        # отдаём как text/plain с корректным mimetype
+        mime = mimetypes.guess_type(target.name)[0] or "text/plain"
+        return send_file(str(target), mimetype=mime, as_attachment=False, download_name=target.name)
+    except Exception as e:
+        return Response("error: " + html.escape(str(e)), status=500)
+
+# ---------- Главная HTML ----------
+INDEX_HTML = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/>
 <title>Deniska Dashboard</title>
 <style>
-:root{
-  --bg:#0b0f14;        /* общий фон */
-  --panel:#111827;     /* карточки/строки */
-  --text:#e5e7eb;      /* основной текст */
-  --muted:#9ca3af;     /* подписи */
-  --line:#232a34;      /* границы */
-  --btn:#1f2937;       /* кнопка */
-  --btnH:#374151;      /* hover */
-  --ok:#22c55e;        /* зелёный */
-  --bad:#ef4444;       /* красный */
-}
-html,body{
-  background:var(--bg); color:var(--text);
-  margin:0;
-  font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;
-  -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
-}
-.top{
-  display:flex; gap:.6rem; align-items:center;
-  padding:12px 16px; background:#0f141b; position:sticky; top:0; z-index:10;
-  border-bottom:1px solid var(--line);
-}
-.btn{
-  background:var(--btn); color:var(--text);
-  border:1px solid var(--line); border-radius:10px;
-  padding:.55rem .9rem; cursor:pointer; text-decoration:none; display:inline-block;
-}
-.btn:hover{ background:var(--btnH); }
-.container{ padding:14px 16px; }
-.status{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; margin-bottom:8px; }
-table{ width:100%; border-collapse:separate; border-spacing:0 10px; }
-th{ color:var(--muted); font-weight:600; text-align:left; padding:10px 14px; }
-td{ padding:12px 14px; background:var(--panel); border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
-tr td:first-child{ border-left:1px solid var(--line); border-top-left-radius:12px; border-bottom-left-radius:12px; }
-tr td:last-child{ border-right:1px solid var(--line); border-top-right-radius:12px; border-bottom-right-radius:12px; }
-.mono{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
-.badge{
-  display:inline-block; border-radius:999px; padding:.15rem .55rem;
-  border:1px solid var(--line); background:#0f1620; color:var(--text);
-}
-.badge.ok{ background:rgba(34,197,94,.15); border-color:#14532d; color:#a7f3d0; }
-.badge.bad{ background:rgba(239,68,68,.12); border-color:#7f1d1d; color:#fecaca; }
-.pill{ padding:2px 8px; border-radius:999px; background:#0e131a; border:1px solid var(--line) }
+ body{background:#0f1115;color:#e7e7ea;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+ .top{display:flex;gap:12px;padding:14px;background:#12141b;position:sticky;top:0;border-bottom:1px solid #2a2f3a}
+ .btn{background:#1a1f2a;border:1px solid #2a3242;border-radius:12px;padding:8px 14px;cursor:pointer;color:#e7e7ea}
+ .btn:hover{background:#202738}
+ .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-left:8px}
+ .ok{background:#0f2b1a;color:#89f0a1;border:1px solid #1c3b28}
+ .bad{background:#2b0f1a;color:#ff9aba;border:1px solid #3b1c28}
+ table{width:100%;border-collapse:collapse;margin:16px}
+ th,td{padding:10px;border-bottom:1px solid #2a2f3a}
+ .mono{font-family:ui-monospace, SFMono-Regular, Menlo, monospace}
+ .pill{padding:2px 8px;border-radius:999px;background:#171a22;border:1px solid #2a2f3a}
+ h1{font-size:18px;font-weight:600;margin:16px}
 </style>
 </head>
 <body>
-  <div class="top">
-    <button class="btn" onclick="doPing()">Ping</button>
-    <button class="btn" onclick="openLogs()">Logs</button>
-    <button class="btn" onclick="doRestart()">Restart</button>
-    <a class="btn" href="/docs" target="_blank">📘 Docs</a>
-  </div>
-
-  <div class="container">
-    <div id="status" class="status">Загрузка…</div>
-    <div id="table"></div>
-  </div>
-
+ <div class="top">
+   <button class="btn" onclick="doPing()">Ping</button>
+   <button class="btn" onclick="openLogs()">Logs</button>
+   <button class="btn" onclick="doRestart()">Restart</button>
+   <a class="btn" href="/docs" target="_blank">📘 Docs</a>
+   <a class="btn" href="/nano" target="_self">📗 NANO</a>
+ </div>
+ <h1 id="ttl">Готово</h1>
+ <div id="status" class="mono" style="padding:12px">Загрузка…</div>
+ <div id="table"></div>
 <script>
-async function fetchJSON(url){
-  const r = await fetch(url, {cache:'no-store'});
-  if(!r.ok) throw new Error('HTTP '+r.status);
-  return await r.json();
-}
-function esc(s){return (s??'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+ async function fetchJSON(url){
+   const r = await fetch(url, {cache:'no-store'});
+   if(!r.ok) throw new Error('HTTP '+r.status);
+   return await r.json();
+ }
+ function esc(s){return (s||'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+ async function load(){
+   try{
+     document.getElementById('status').textContent='Загрузка…';
+     const data = await fetchJSON('/api/services');
+     const rows = data.rows||[];
+     let html = '<table><thead><tr><th>Проект</th><th>Unit</th><th>Статус</th><th>Ветка</th><th>Origin</th><th>Dirty</th><th>Путь</th></tr></thead><tbody>';
+     for(const r of rows){
+       const ok = (r.status||'').toLowerCase()==='active';
+       html += '<tr>'
+         + '<td>'+esc(r.name||'')+'</td>'
+         + '<td><span class="pill">'+esc(r.unit||'')+'</span></td>'
+         + '<td>'+(ok?'<span class="badge ok">Active</span>':'<span class="badge bad">'+esc(r.status||'?')+'</span>')+'</td>'
+         + '<td>'+esc(r.branch||'-')+'</td>'
+         + '<td>'+esc(r.origin||'-')+'</td>'
+         + '<td>'+esc(r.dirty||'-')+'</td>'
+         + '<td class="mono">'+esc(r.path||'')+'</td>'
+         + '</tr>';
+     }
+     html += '</tbody></table>';
+     document.getElementById('table').innerHTML = html;
+     document.getElementById('status').textContent='Готово';
+   }catch(e){
+     document.getElementById('status').textContent='Ошибка: '+e.message;
+   }
+ }
+ async function doPing(){
+   try{ await fetchJSON('/ping'); document.getElementById('status').textContent='Ping: ok'; }
+   catch(e){ document.getElementById('status').textContent='Ping error: '+e.message; }
+ }
+ function openLogs(){ window.open('/logs','_blank'); }
+ async function doRestart(){
+   try{ const r=await fetchJSON('/restart'); document.getElementById('status').textContent='Restart: '+(r.ok?'ok':'fail'); }
+   catch(e){ document.getElementById('status').textContent='Restart error: '+e.message; }
+ }
+ load();
+</script>
+</body>
+</html>
+"""
 
-async function load(){
-  try{
-    document.getElementById('status').textContent='Загрузка…';
-    const data = await fetchJSON('/api/services');
-    const rows = data.rows||[];
-    let html = '<table><thead><tr><th>Проект</th><th>Unit</th><th>Статус</th><th>Ветка</th><th>Origin</th><th>Dirty</th><th>Путь</th></tr></thead><tbody>';
-    for(const r of rows){
-      const ok = (r.status||'').toLowerCase()==='active';
-      html += `<tr>
-        <td>${esc(r.name)}</td>
-        <td><span class="pill mono">${esc(r.unit)}</span></td>
-        <td>${ok?'<span class="badge ok">Active</span>':'<span class="badge bad">'+esc(r.status||'?')+'</span>'}</td>
-        <td>${esc(r.branch||'-')}</td>
-        <td class="mono">${esc(r.origin||'-')}</td>
-        <td>${esc(r.dirty||'-')}</td>
-        <td class="mono">${esc(r.path||'')}</td>
-      </tr>`;
-    }
-    html += '</tbody></table>';
-    document.getElementById('table').innerHTML = html;
-    document.getElementById('status').textContent='Готово';
-  }catch(e){
-    document.getElementById('status').textContent='Ошибка: '+e.message;
-  }
-}
-
-async function doPing(){
-  try{ await fetchJSON('/ping'); document.getElementById('status').textContent='Ping: ok'; }
-  catch(e){ document.getElementById('status').textContent='Ping error: '+e.message; }
-}
-function openLogs(){ window.open('/logs','_blank'); }
-async function doRestart(){
-  try{ const r=await fetchJSON('/restart'); document.getElementById('status').textContent='Restart: '+(r.ok?'ok':'fail'); }
-  catch(e){ document.getElementById('status').textContent='Restart error: '+e.message; }
-}
-
-load();
+NANO_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>NANO Archive</title>
+<style>
+ body{background:#0f1115;color:#e7e7ea;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0}
+ .top{display:flex;gap:12px;padding:14px;background:#12141b;position:sticky;top:0;border-bottom:1px solid #2a2f3a}
+ .btn{background:#1a1f2a;border:1px solid #2a3242;border-radius:12px;padding:8px 14px;text-decoration:none;color:#e7e7ea}
+ .btn:hover{background:#202738}
+ .card{margin:16px;border:1px solid #2a2f3a;border-radius:14px;background:#111521}
+ .card h2{margin:0;padding:12px 16px;border-bottom:1px solid #2a2f3a;font-size:16px}
+ .list{padding:8px 16px 16px 16px}
+ .item{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #232a36}
+ .muted{opacity:.75}
+ .mono{font-family:ui-monospace, SFMono-Regular, Menlo, monospace}
+</style>
+</head>
+<body>
+ <div class="top">
+   <a class="btn" href="/">← Dashboard</a>
+   <span class="btn">📗 NANO</span>
+ </div>
+ <div id="root"></div>
+<script>
+ function esc(s){return (s||'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+ async function fetchJSON(url){ const r=await fetch(url,{cache:'no-store'}); if(!r.ok) throw new Error('HTTP '+r.status); return await r.json(); }
+ function formatTS(ts){ try{ const d=new Date(ts*1000); return d.toLocaleString(); }catch(_){ return '-'; } }
+ async function load(){
+   const data = await fetchJSON('/nano_index');
+   const projects = data.projects||[];
+   let html='';
+   for(const p of projects){
+     html += '<div class="card"><h2>'+esc(p.project)+' — '+esc(p.path)+'</h2><div class="list">';
+     if(!p.items || p.items.length===0){
+       html += '<div class="muted">Файлов нет (docs/NANO)</div>';
+     }else{
+       for(const it of p.items){
+         const url = '/nano_view?project='+encodeURIComponent(p.project)+'&path='+encodeURIComponent(it.relpath);
+         html += '<div class="item"><div>'
+              + '<a class="mono" href="'+url+'" target="_blank">'+esc(it.relpath)+'</a>'
+              + '</div><div class="muted">'+(it.size||0)+' B · '+esc(formatTS(it.mtime))+'</div></div>';
+       }
+     }
+     html += '</div></div>';
+   }
+   document.getElementById('root').innerHTML = html;
+ }
+ load();
 </script>
 </body>
 </html>
@@ -224,5 +340,10 @@ load();
 def index():
     return Response(INDEX_HTML, mimetype="text/html")
 
+@app.route("/nano")
+def nano_page():
+    return Response(NANO_HTML, mimetype="text/html")
+
 if __name__ == "__main__":
+    # Разворачиваем только на 0.0.0.0:18081 (systemd управляет жизненным циклом)
     app.run(host="0.0.0.0", port=18081)
