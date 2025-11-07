@@ -24,3 +24,9 @@ out/
 *.jpg
 *.png
 *.mp4
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pytest_cache/
+.DS_Store
