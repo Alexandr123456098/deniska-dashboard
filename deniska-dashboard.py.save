@@ -1,0 +1,87 @@
+.btn:hover{ background:var(--btnH); }
+.container{ padding:14px 16px; }
+.status{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; margin-bottom:8px; }
+table{ width:100%; border-collapse:separate; border-spacing:0 10px; }
+th{ color:var(--muted); font-weight:600; text-align:left; padding:10px 14px; }
+td{ padding:12px 14px; background:var(--panel); border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+tr td:first-child{ border-left:1px solid var(--line); border-top-left-radius:12px; border-bottom-left-radius:12px; }
+tr td:last-child{ border-right:1px solid var(--line); border-top-right-radius:12px; border-bottom-right-radius:12px; }
+.mono{ font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+.badge{
+  display:inline-block; border-radius:999px; padding:.15rem .55rem;
+  border:1px solid var(--line); background:#0f1620; color:var(--text);
+}
+.badge.ok{ background:rgba(34,197,94,.15); border-color:#14532d; color:#a7f3d0; }
+.badge.bad{ background:rgba(239,68,68,.12); border-color:#7f1d1d; color:#fecaca; }
+.pill{ padding:2px 8px; border-radius:999px; background:#0e131a; border:1px solid var(--line) }
+</style>
+</head>
+<body>
+  <div class="top">
+    <button class="btn" onclick="doPing()">Ping</button>
+    <button class="btn" onclick="openLogs()">Logs</button>
+    <button class="btn" onclick="doRestart()">Restart</button>
+    <a class="btn" href="/docs" target="_blank">📘 Docs</a>
+  </div>
+
+  <div class="container">
+    <div id="status" class="status">Загрузка…</div>
+    <div id="table"></div>
+  </div>
+
+<script>
+async function fetchJSON(url){
+  const r = await fetch(url, {cache:'no-store'});
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return await r.json();
+}
+function esc(s){return (s??'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+
+async function load(){
+  try{
+    document.getElementById('status').textContent='Загрузка…';
+    const data = await fetchJSON('/api/services');
+    const rows = data.rows||[];
+    let html = '<table><thead><tr><th>Проект</th><th>Unit</th><th>Статус</th><th>Ветка</th><th>Origin</th><th>Dirty</th><th>Путь</th></tr></thead><tbody>';
+    for(const r of rows){
+      const ok = (r.status||'').toLowerCase()==='active';
+      html += `<tr>
+        <td>${esc(r.name)}</td>
+        <td><span class="pill mono">${esc(r.unit)}</span></td>
+        <td>${ok?'<span class="badge ok">Active</span>':'<span class="badge bad">'+esc(r.status||'?')+'</span>'}</td>
+        <td>${esc(r.branch||'-')}</td>
+        <td class="mono">${esc(r.origin||'-')}</td>
+        <td>${esc(r.dirty||'-')}</td>
+        <td class="mono">${esc(r.path||'')}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('table').innerHTML = html;
+    document.getElementById('status').textContent='Готово';
+  }catch(e){
+    document.getElementById('status').textContent='Ошибка: '+e.message;
+  }
+}
+
+async function doPing(){
+  try{ await fetchJSON('/ping'); document.getElementById('status').textContent='Ping: ok'; }
+  catch(e){ document.getElementById('status').textContent='Ping error: '+e.message; }
+}
+function openLogs(){ window.open('/logs','_blank'); }
+async function doRestart(){
+  try{ const r=await fetchJSON('/restart'); document.getElementById('status').textContent='Restart: '+(r.ok?'ok':'fail'); }
+  catch(e){ document.getElementById('status').textContent='Restart error: '+e.message; }
+}
+
+load();
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=18081)
