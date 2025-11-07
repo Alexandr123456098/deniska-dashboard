@@ -1,451 +1,72 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-# Deniska Dashboard — единая панель статусов/логов + задачи (/task)
-# Слоты: /, /metrics, /metrics/series, /api/services, /api/ping,
-#        /logs/<unit>, /logs/stream/<unit>, /api/restart/<unit>,
-#        /sync/<project>, /compose, /task   (белый список действий)
-#
-# Требования: Flask, psutil
-#   /root/projects/deniska-dashboard/venv/bin/pip install flask psutil
-
-import os, json, time, psutil, socket, threading, subprocess
-from datetime import datetime
-from flask import Flask, Response, request, jsonify, stream_with_context
-
-PORT = int(os.getenv("DENISKA_DASH_PORT", "18081"))
-HOST = "0.0.0.0"
-
-MAP_FILE = "/root/secrets/persobi_global_state.json"  # единый мозг
-
-SYNC_BIN = "/usr/local/bin/deniska-sync.sh"
-COMPOSE_BIN = "/usr/local/bin/deniska-compose.sh"
-REMOTE_ENV = "/root/secrets/deniska-remote.env"  # TG_BOT/TG_CHAT для нотификаций
-SERVER_NAME = socket.gethostname()
+from flask import Flask, jsonify, render_template_string, send_file
+import subprocess, json, os, datetime
 
 app = Flask(__name__)
 
-# -------------------- утилиты --------------------
-
-def load_env_vars(path):
-    res = {}
-    if not os.path.exists(path):
-        return res
-    with open(path) as f:
-        for line in f:
-            line=line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                k,v=line.split("=",1)
-                res[k.strip()] = v.strip().strip('"').strip("'")
-    return res
-
-TG = load_env_vars(REMOTE_ENV)
-
-def run(cmd, timeout=None):
-    return subprocess.run(
-        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, timeout=timeout
-    ).stdout
-
-def sysd_active(unit):
-    if not unit:
-        return "not-found"
-    code = subprocess.call(["systemctl","is-active","--quiet", unit])
-    if code==0: return "active"
-    if code==3: return "inactive"
-    return "not-found"
-
-def tg_notify(text):
-    bot = TG.get("TG_BOT","")
-    chat = TG.get("TG_CHAT","")
-    if not bot or not chat:
-        return
-    try:
-        run(f'curl -s -X POST "https://api.telegram.org/bot{bot}/sendMessage" -d "chat_id={chat}" -d "text={text}"')
-    except Exception:
-        pass
-
-def load_map_rows():
-    try:
-        with open(MAP_FILE, "r") as f:
-            data = json.load(f)
-        rows = []
-        for name, repo in (data or {}).items():
-            unit = (repo.get("service") if isinstance(repo, dict) else f"{name}.service")
-            status = sysd_active(unit) if unit else "not-found"
-            rows.append({"name": name, "repo": repo, "unit": unit, "status": status})
-        return rows
-    except Exception:
-        return []
-
-# -------------------- метрики --------------------
-
-_metrics_ring = {"cpu":[], "ram":[]}
-_RING_MAX = 60  # ~последняя минута
-
-def metrics_tick():
-    while True:
-        try:
-            cpu = psutil.cpu_percent(interval=1.0)
-            ram = psutil.virtual_memory().percent
-            for k, v in (("cpu", cpu), ("ram", ram)):
-                arr = _metrics_ring[k]
-                arr.append(v)
-                if len(arr) > _RING_MAX:
-                    del arr[0:len(arr)-_RING_MAX]
-        except Exception:
-            pass
-
-threading.Thread(target=metrics_tick, daemon=True).start()
-
-@app.get("/metrics")
-def metrics_json():
-    return jsonify({
-        "cpu": _metrics_ring["cpu"][-1] if _metrics_ring["cpu"] else psutil.cpu_percent(),
-        "ram": _metrics_ring["ram"][-1] if _metrics_ring["ram"] else psutil.virtual_memory().percent,
-        "uptime": (datetime.now() - datetime.fromtimestamp(psutil.boot_time())).seconds
-    })
-
-@app.get("/metrics/series")
-def metrics_series():
-    boot = datetime.fromtimestamp(psutil.boot_time())
-    delta = datetime.now() - boot
-    d = delta.days
-    h = delta.seconds//3600
-    m = (delta.seconds%3600)//60
-    return jsonify({"cpu": _metrics_ring["cpu"], "ram": _metrics_ring["ram"], "uptime": f"{d}d {h}h {m}m"})
-
-# -------------------- API: статусы/рестарт --------------------
-
-@app.get("/api/services")
-def api_services():
-    return jsonify({"server": SERVER_NAME, "at": datetime.now().isoformat(), "rows": load_map_rows()})
-
-@app.get("/api/ping")
-def api_ping():
-    out = {}
-    for row in load_map_rows():
-        out[row["name"]] = sysd_active(row["unit"])
-    return jsonify({"server": SERVER_NAME, "ping": out, "at": datetime.now().isoformat()})
-
-@app.post("/api/restart/<unit>")
-def api_restart(unit):
-    unit = unit.strip()
-    subprocess.call(["systemctl","restart",unit])
-    st = "active" if subprocess.call(["systemctl","is-active","--quiet",unit])==0 else "inactive"
-    return jsonify({"ok": True, "status": st})
-
-# -------------------- sync / compose --------------------
-
-@app.post("/sync/<project>")
-def sync_project(project):
-    if not os.path.exists(SYNC_BIN):
-        return jsonify({"ok":False,"msg":"sync tool not found"}), 500
-    env = f". {REMOTE_ENV}; " if os.path.exists(REMOTE_ENV) else ""
-    out = run(f'{env}{SYNC_BIN} 2>&1')
-    return jsonify({"ok":True,"msg":out})
-
-@app.post("/compose")
-def compose():
-    payload = request.get_json(force=True, silent=True) or {}
-    name = (payload.get("name") or "").strip()
-    sources = payload.get("sources") or []
-    if not name or not sources:
-        return jsonify({"ok":False,"msg":"name & sources required"}), 400
-    if not os.path.exists(COMPOSE_BIN):
-        return jsonify({"ok":False,"msg":"compose tool not found"}), 500
-    cmd = f'{COMPOSE_BIN} {name} ' + " ".join(sources)
-    out = run(cmd)
-    tg_notify(f"✅ Новый бот {name} создан (сборка: {', '.join(sources)})")
-    return jsonify({"ok":True,"msg":out})
-
-# -------------------- логи --------------------
-
-@app.get("/logs/<unit>")
-def logs_tail(unit):
-    unit = unit.strip()
-    out = run(f'journalctl -u {unit} -n 200 --no-pager 2>&1')
-    return Response(f"<pre>{out}</pre>", mimetype="text/html; charset=utf-8")
-
-@app.get("/logs/stream/<unit>")
-def logs_stream(unit):
-    unit = unit.strip()
-    def generate():
-        p = subprocess.Popen(["journalctl","-u",unit,"-f","-n","50","-o","short"],
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        try:
-            for line in iter(p.stdout.readline, ''):
-                yield f"data: {line.rstrip()}\n\n"
-        finally:
-            try: p.terminate()
-            except Exception: pass
-    headers = {"Content-Type":"text/event-stream", "Cache-Control":"no-cache", "Connection":"keep-alive"}
-    return Response(stream_with_context(generate()), headers=headers)
-
-# -------------------- TASK: безопасные действия --------------------
-# Белый список: unit.status, unit.restart, logs.tail, snapshot.now,
-#               git.autosave, state.get, state.set
-
-def unit_status(unit):
-    st = sysd_active(unit)
-    pid = subprocess.getoutput(f"systemctl show -p MainPID {unit} | cut -d= -f2")
-    return {"unit": unit, "status": st, "pid": pid}
-
-def unit_restart(unit):
-    subprocess.call(["systemctl","restart",unit])
-    time.sleep(0.8)
-    return unit_status(unit)
-
-def logs_tail_text(unit, n=200):
-    n = max(10, min(int(n), 2000))
-    out = run(f'journalctl -u {unit} -n {n} --no-pager 2>&1')
-    return {"unit": unit, "lines": n, "text": out[-20000:]}
-
-def snapshot_now():
-    ts = datetime.now().strftime("%F_%H%M")
-    cmd = (
-      'tar czf "/root/snapshots/deniska_{ts}.tgz" '
-      '/root/projects/deniska-dashboard/deniska-dashboard.py '
-      '/etc/systemd/system/deniska-dashboard.service '
-      '/root/secrets/persobi_global_state.json '
-      '/etc/nginx/sites-available/deniska-dashboard.conf '
-      '/etc/nginx/deniska.htpasswd '
-      '/etc/nginx/conf.d/deniska-limits.conf '
-      '/etc/systemd/system/jurist.service '
-      '/etc/systemd/system/persobi.service 2>/dev/null || true'
-    ).format(ts=ts)
-    out = run(cmd)
-    return {"ok": True, "snapshot": f"/root/snapshots/deniska_{ts}.tgz", "out": out}
-
-def git_autosave():
-    if not os.path.exists("/root/bin/git-autosave.sh"):
-        return {"ok": False, "msg": "git-autosave.sh not found"}
-    out = run("/root/bin/git-autosave.sh 2>&1")
-    return {"ok": True, "out": out[-20000:]}
-
-def state_get():
-    try:
-        with open(MAP_FILE, "r") as f:
-            data = json.load(f)
-        return {"ok": True, "state": data}
-    except Exception as e:
-        return {"ok": False, "msg": str(e)}
-
-def state_set(payload):
-    new_state = payload.get("state")
-    if not isinstance(new_state, dict):
-        return {"ok": False, "msg": "state must be object"}
-    # сделаем бэкап
-    run(f'cp -a {MAP_FILE} {MAP_FILE}.bak.{datetime.now().strftime("%F_%H%M%S")}')
-    with open(MAP_FILE, "w") as f:
-        json.dump(new_state, f, ensure_ascii=False, indent=2)
-    return {"ok": True}
-
-ALLOWED_ACTIONS = {
-    "unit.status": lambda p: unit_status(p.get("unit","").strip()),
-    "unit.restart": lambda p: unit_restart(p.get("unit","").strip()),
-    "logs.tail": lambda p: logs_tail_text(p.get("unit","").strip(), p.get("n",200)),
-    "snapshot.now": lambda p: snapshot_now(),
-    "git.autosave": lambda p: git_autosave(),
-    "state.get": lambda p: state_get(),
-    "state.set": lambda p: state_set(p),
-}
-
-@app.post("/task")
-def task():
-    payload = request.get_json(force=True, silent=True) or {}
-    action = (payload.get("action") or "").strip()
-    if action not in ALLOWED_ACTIONS:
-        return jsonify({"ok": False, "msg": "action not allowed", "allowed": list(ALLOWED_ACTIONS.keys())}), 400
-    try:
-        res = ALLOWED_ACTIONS[action](payload)
-        return jsonify({"ok": True, "action": action, "result": res})
-    except Exception as e:
-        return jsonify({"ok": False, "action": action, "msg": str(e)}), 500
-
-# -------------------- HTML --------------------
-
-ROW = """  <tr>
-  <td>{name}</td>
-  <td>{repo_cell}</td>
-  <td>{unit}</td>
-  <td>{status_badge}</td>
-  <td>
-    <button class="btn" onclick="doSync('{name}')">Sync</button>
-    <a class="btn" href="/logs/{unit}" target="_blank">Logs</a>
-    <a class="btn" href="/logs/stream/{unit}" target="_blank">Live</a>
-    <button class="btn" onclick="doTaskRestart('{unit}')">Restart</button>
-  </td>
-</tr>
-"""
-
-def badge(status):
-    if status == "active": return '<span class="b b-ok">● Active</span>'
-    if status == "inactive": return '<span class="b b-warn">⚠ Inactive</span>'
-    return '<span class="b b-warn">⚠ not found</span>'
-
-def make_repo_cell(repo):
-    try:
-        if isinstance(repo, str):
-            repo_name = repo.split("/")[-1] or repo
-            return f'<a href="{repo}" target="_blank">{repo_name}</a>'
-        elif isinstance(repo, dict):
-            text = repo.get("git") or repo.get("name") or "repo"
-            desc = repo.get("desc", "")
-            if isinstance(text, str) and (text.startswith("http://") or text.startswith("https://")):
-                visible = text.split("/")[-1] or text
-                return f'<a href="{text}" target="_blank" title="{desc}">{visible}</a>'
-            return f'<span title="{desc}">{text}</span>'
-        else:
-            return '<span>—</span>'
-    except Exception:
-        return '<span>—</span>'
-
-@app.get("/")
-def index():
-    try:
-        rows_html = []
-        for r in load_map_rows():
-            rows_html.append(ROW.format(
-                name=r.get("name","—"),
-                repo_cell=make_repo_cell(r.get("repo")),
-                unit=r.get("unit","—"),
-                status_badge=badge(r.get("status","not-found"))
-            ))
-        rows_html = "\n".join(rows_html)
-        t = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><title>Deniska Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+HTML = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Deniska Dashboard</title>
 <style>
-body{{background:#0b0b0e;color:#eaeaf0;font:16px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial}}
-h1{{display:flex;align-items:center;gap:.5rem}}
-.wrap{{max-width:1100px;margin:24px auto;padding:0 16px}}
-.table{{width:100%;border-collapse:collapse;margin-top:12px}}
-.table th,.table td{{padding:12px 10px;border-bottom:1px solid #24242a}}
-th{{text-align:left;color:#9da3ae;letter-spacing:.02em}}
-a{{color:#6aa7ff;text-decoration:none}}
-.btn{{background:#111827;border:1px solid #30343c;border-radius:10px;color:#aab0bc;padding:6px 10px;margin-right:6px;cursor:pointer}}
-.btn:hover{{border-color:#4b5563;color:#cbd5e1}}
-.b{{padding:4px 10px;border-radius:999px;font-size:14px}}
-.b-ok{{background:#05290a;color:#36d979}}
-.b-warn{{background:#2b2305;color:#f7d154}}
-.topline{{display:flex;gap:16px;align-items:center;color:#aab0bc;flex-wrap:wrap}}
-.spark{{display:flex;gap:2px;align-items:flex-end;height:28px;min-width:120px}}
-.spark div{{width:4px;background:#3b82f6;opacity:.85}}
-small{{color:#9da3ae}}
-input, .btn-compose{{border-radius:12px;border:1px solid #2a2f39;background:#0f1218;color:#e6e6ee;padding:10px}}
-.grid{{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-top:14px}}
-@media (max-width: 720px) {{
-  .grid{{grid-template-columns:1fr;}}
-  .table td:nth-child(2){{word-break:break-all}}
-}}
+body { font-family: sans-serif; background: #111; color: #eee; text-align: center; margin: 0; padding: 0; }
+header { background: #222; padding: 12px; display: flex; justify-content: center; gap: 14px; }
+button { background: #333; color: #fff; border: none; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+button:hover { background: #555; }
+pre { text-align: left; margin: 20px auto; width: 90%; background: #000; color: #0f0; padding: 10px; border-radius: 8px; overflow-x: auto; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>🧩 Deniska Dashboard</h1>
-  <div class="topline">
-    <span id="meta">Сервер: {SERVER_NAME} | Обновлено: {t}</span>
-    <span id="live">| CPU: <b id="cpu">…</b>% &nbsp; RAM: <b id="ram">…</b>% &nbsp; Uptime: <b id="uptime">…</b></span>
-    <div class="spark" id="sparkCPU" title="CPU sparkline"></div>
-    <div class="spark" id="sparkRAM" title="RAM sparkline"></div>
-    <button class="btn" onclick="massPing()">Ping</button>
-    <button class="btn" onclick="doSnapshot()">Snapshot</button>
-    <button class="btn" onclick="doAutosave()">Autosave</button>
-  </div>
-
-  <table class="table">
-    <thead><tr>
-      <th>Проект</th><th>Репозиторий</th><th>Сервис</th><th>Статус</th><th>Действия</th>
-    </tr></thead>
-    <tbody id="rows">
-      {rows_html}
-    </tbody>
-  </table>
-
-  <div style="border-top:1px solid #24242a;margin-top:14px;padding-top:14px">
-    <h3>Создать нового бота</h3>
-    <div class="grid">
-      <input id="newname" placeholder="новый бот">
-      <input id="newsources" placeholder="через пробел: jurist persobi">
-      <button class="btn-compose" onclick="compose()">Compose</button>
-    </div>
-    <small id="composeOut"></small>
-  </div>
-</div>
+<header>
+  <button onclick="fetchPing()">Ping</button>
+  <button onclick="fetchLogs()">Logs</button>
+  <button onclick="fetchRestart()">Restart</button>
+  <button onclick="window.open('/docs', '_blank')">📘 Docs</button>
+</header>
+<pre id="output">Загрузка...</pre>
 <script>
-const maxBars = 60;
-const sparkCPU = document.getElementById('sparkCPU');
-const sparkRAM = document.getElementById('sparkRAM');
-
-function drawSpark(div, arr) {{
-  div.innerHTML = '';
-  const max = Math.max(1, ...arr);
-  arr.forEach(v => {{
-    const h = Math.max(2, Math.round((v/max)*28));
-    const bar = document.createElement('div');
-    bar.style.height = h + 'px';
-    div.appendChild(bar);
-  }});
-}}
-
-async function refreshMetrics() {{
-  try {{
-    const r = await fetch('/metrics/series'); 
-    const j = await r.json();
-    const lastCPU = (j.cpu && j.cpu.length) ? j.cpu[j.cpu.length-1] : 0;
-    const lastRAM = (j.ram && j.ram.length) ? j.ram[j.ram.length-1] : 0;
-    document.getElementById('cpu').textContent = (typeof lastCPU === 'number') ? lastCPU.toFixed(1) : lastCPU;
-    document.getElementById('ram').textContent = lastRAM;
-    document.getElementById('uptime').textContent = j.uptime || '';
-    drawSpark(sparkCPU, (j.cpu || []).slice(-maxBars));
-    drawSpark(sparkRAM, (j.ram || []).slice(-maxBars));
-  }} catch(e) {{}}
-}}
-setInterval(refreshMetrics, 1000); refreshMetrics();
-
-async function massPing(){{
-  const r = await fetch('/api/ping'); const j = await r.json();
-  alert('Ping:\\n' + JSON.stringify(j.ping, null, 2));
-}}
-
-async function doSync(name){{
-  const r = await fetch('/sync/'+name, {{method:'POST'}});
-  const j = await r.json(); alert((j.msg||'done').slice(-2000));
-}}
-
-async function compose(){{
-  const name = document.getElementById('newname').value.trim();
-  const sources = document.getElementById('newsources').value.trim().split(/\\s+/).filter(Boolean);
-  const r = await fetch('/compose', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{name, sources}})}});
-  const j = await r.json();
-  document.getElementById('composeOut').textContent = (j.msg||'').slice(-2000);
-}}
-
-async function doSnapshot(){{
-  const r = await fetch('/task', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{action:'snapshot.now'}})}});
-  const j = await r.json(); alert(JSON.stringify(j.result||j, null, 2));
-}}
-
-async function doAutosave(){{
-  const r = await fetch('/task', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{action:'git.autosave'}})}});
-  const j = await r.json(); alert((j.result && j.result.out ? j.result.out : JSON.stringify(j, null, 2)).slice(-2000));
-}}
-
-async function doTaskRestart(unit){{
-  const r = await fetch('/task', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{action:'unit.restart', unit}})}});
-  const j = await r.json(); alert(JSON.stringify(j.result||j, null, 2));
-}}
+async function fetchPing(){ const r=await fetch('/ping'); document.getElementById('output').innerText=await r.text(); }
+async function fetchLogs(){ const r=await fetch('/logs'); document.getElementById('output').innerText=await r.text(); }
+async function fetchRestart(){ const r=await fetch('/restart'); document.getElementById('output').innerText=await r.text(); }
+fetchPing();
 </script>
-</body></html>
+</body>
+</html>
 """
-    except Exception as e:
-        return Response(f"<pre>Render error: {e}</pre>", mimetype="text/html; charset=utf-8"), 500
 
-# -------------------- app run --------------------
+@app.route('/')
+def index():
+    return render_template_string(HTML)
 
-if __name__ == "__main__":
-    app.run(host=HOST, port=PORT, debug=False)
+@app.route('/ping')
+def ping():
+    try:
+        out = subprocess.check_output(["bash", "/root/bin/deniska-status.sh"], text=True)
+        return out
+    except subprocess.CalledProcessError as e:
+        return f"Ошибка выполнения: {e}"
+
+@app.route('/logs')
+def logs():
+    out = subprocess.getoutput("journalctl -u deniska-snapshot.service -n 100 --no-pager")
+    return out[-4000:]
+
+@app.route('/restart')
+def restart():
+    os.system("systemctl restart deniska-snapshot.service")
+    return "[✓] Сервис deniska-snapshot.service перезапущен"
+
+@app.route('/docs')
+def docs():
+    path = "/root/docs/DENISKA_PASSPORT.md"
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            content = f.read()
+        # простейший HTML-просмотр паспорта
+        return f"<html><body style='background:#111;color:#eee;font-family:sans-serif;padding:20px;white-space:pre-wrap;'>{content}</body></html>"
+    return "Файл паспорта не найден."
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=18081)
