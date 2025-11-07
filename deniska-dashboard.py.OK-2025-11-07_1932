@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Deniska Dashboard — единая панель статусов/логов + задачи (/task)
-# Слоты: /, /metrics, /metrics/series, /api/services, /api/ping,
-#        /logs/<unit>, /logs/stream/<unit>, /api/restart/<unit>,
-#        /sync/<project>, /compose, /task   (белый список действий)
-#
-# Требования: Flask, psutil
-#   /root/projects/deniska-dashboard/venv/bin/pip install flask psutil
-
 import os, json, time, psutil, socket, threading, subprocess
 from datetime import datetime
 from flask import Flask, Response, request, jsonify, stream_with_context
@@ -16,16 +8,31 @@ from flask import Flask, Response, request, jsonify, stream_with_context
 PORT = int(os.getenv("DENISKA_DASH_PORT", "18081"))
 HOST = "0.0.0.0"
 
-MAP_FILE = "/root/secrets/persobi_global_state.json"  # единый мозг
+# ЕДИНЫЙ МОЗГ
+MAP_FILE = "/root/secrets/persobi_global_state.json"
 
 SYNC_BIN = "/usr/local/bin/deniska-sync.sh"
 COMPOSE_BIN = "/usr/local/bin/deniska-compose.sh"
-REMOTE_ENV = "/root/secrets/deniska-remote.env"  # TG_BOT/TG_CHAT для нотификаций
+REMOTE_ENV = "/root/secrets/deniska-remote.env"  # TG_BOT/TG_CHAT
 SERVER_NAME = socket.gethostname()
 
 app = Flask(__name__)
 
-# -------------------- утилиты --------------------
+# --- утилиты ---------------------------------------------------------------
+
+def load_map():
+    try:
+        with open(MAP_FILE, "r") as f:
+            data = json.load(f)
+        # ожидаем объект вида {key: {...}}; приводим к списку строк таблицы
+        rows = []
+        for name, repo in (data or {}).items():
+            unit = (repo.get("service") if isinstance(repo, dict) else f"{name}.service")
+            status = sysd_active(unit) if unit else "not-found"
+            rows.append({"name": name, "repo": repo, "unit": unit, "status": status})
+        return rows
+    except Exception:
+        return []
 
 def load_env_vars(path):
     res = {}
@@ -57,42 +64,27 @@ def sysd_active(unit):
     if code==3: return "inactive"
     return "not-found"
 
-def tg_notify(text):
-    bot = TG.get("TG_BOT","")
-    chat = TG.get("TG_CHAT","")
-    if not bot or not chat:
-        return
-    try:
-        run(f'curl -s -X POST "https://api.telegram.org/bot{bot}/sendMessage" -d "chat_id={chat}" -d "text={text}"')
-    except Exception:
-        pass
+def human_uptime():
+    boot = datetime.fromtimestamp(psutil.boot_time())
+    delta = datetime.now() - boot
+    d = delta.days
+    h = delta.seconds//3600
+    m = (delta.seconds%3600)//60
+    return f"{d}d {h}h {m}m"
 
-def load_map_rows():
-    try:
-        with open(MAP_FILE, "r") as f:
-            data = json.load(f)
-        rows = []
-        for name, repo in (data or {}).items():
-            unit = (repo.get("service") if isinstance(repo, dict) else f"{name}.service")
-            status = sysd_active(unit) if unit else "not-found"
-            rows.append({"name": name, "repo": repo, "unit": unit, "status": status})
-        return rows
-    except Exception:
-        return []
-
-# -------------------- метрики --------------------
+# --- метрики ---------------------------------------------------------------
 
 _metrics_ring = {"cpu":[], "ram":[]}
-_RING_MAX = 60  # ~последняя минута
+_RING_MAX = 60  # 60 точек ~ последняя минута
 
 def metrics_tick():
     while True:
         try:
             cpu = psutil.cpu_percent(interval=1.0)
             ram = psutil.virtual_memory().percent
-            for k, v in (("cpu", cpu), ("ram", ram)):
-                arr = _metrics_ring[k]
-                arr.append(v)
+            for key,val in (("cpu",cpu),("ram",ram)):
+                arr = _metrics_ring[key]
+                arr.append(val)
                 if len(arr) > _RING_MAX:
                     del arr[0:len(arr)-_RING_MAX]
         except Exception:
@@ -105,28 +97,30 @@ def metrics_json():
     return jsonify({
         "cpu": _metrics_ring["cpu"][-1] if _metrics_ring["cpu"] else psutil.cpu_percent(),
         "ram": _metrics_ring["ram"][-1] if _metrics_ring["ram"] else psutil.virtual_memory().percent,
-        "uptime": (datetime.now() - datetime.fromtimestamp(psutil.boot_time())).seconds
+        "uptime": human_uptime()
     })
 
 @app.get("/metrics/series")
 def metrics_series():
-    boot = datetime.fromtimestamp(psutil.boot_time())
-    delta = datetime.now() - boot
-    d = delta.days
-    h = delta.seconds//3600
-    m = (delta.seconds%3600)//60
-    return jsonify({"cpu": _metrics_ring["cpu"], "ram": _metrics_ring["ram"], "uptime": f"{d}d {h}h {m}m"})
+    return jsonify({
+        "cpu": _metrics_ring["cpu"],
+        "ram": _metrics_ring["ram"],
+        "uptime": human_uptime()
+    })
 
-# -------------------- API: статусы/рестарт --------------------
+# --- список проектов/статусы ----------------------------------------------
+
+def projects_table():
+    return load_map()
 
 @app.get("/api/services")
 def api_services():
-    return jsonify({"server": SERVER_NAME, "at": datetime.now().isoformat(), "rows": load_map_rows()})
+    return jsonify({"server": SERVER_NAME, "at": datetime.now().isoformat(), "rows": projects_table()})
 
 @app.get("/api/ping")
 def api_ping():
     out = {}
-    for row in load_map_rows():
+    for row in projects_table():
         out[row["name"]] = sysd_active(row["unit"])
     return jsonify({"server": SERVER_NAME, "ping": out, "at": datetime.now().isoformat()})
 
@@ -137,7 +131,17 @@ def api_restart(unit):
     st = "active" if subprocess.call(["systemctl","is-active","--quiet",unit])==0 else "inactive"
     return jsonify({"ok": True, "status": st})
 
-# -------------------- sync / compose --------------------
+# --- синхронизации / compose ----------------------------------------------
+
+def tg_notify(text):
+    bot = TG.get("TG_BOT","")
+    chat = TG.get("TG_CHAT","")
+    if not bot or not chat:
+        return
+    try:
+        run(f'curl -s -X POST "https://api.telegram.org/bot{bot}/sendMessage" -d "chat_id={chat}" -d "text={text}"')
+    except Exception:
+        pass
 
 @app.post("/sync/<project>")
 def sync_project(project):
@@ -161,7 +165,7 @@ def compose():
     tg_notify(f"✅ Новый бот {name} создан (сборка: {', '.join(sources)})")
     return jsonify({"ok":True,"msg":out})
 
-# -------------------- логи --------------------
+# --- логи: статические и живые --------------------------------------------
 
 @app.get("/logs/<unit>")
 def logs_tail(unit):
@@ -184,88 +188,7 @@ def logs_stream(unit):
     headers = {"Content-Type":"text/event-stream", "Cache-Control":"no-cache", "Connection":"keep-alive"}
     return Response(stream_with_context(generate()), headers=headers)
 
-# -------------------- TASK: безопасные действия --------------------
-# Белый список: unit.status, unit.restart, logs.tail, snapshot.now,
-#               git.autosave, state.get, state.set
-
-def unit_status(unit):
-    st = sysd_active(unit)
-    pid = subprocess.getoutput(f"systemctl show -p MainPID {unit} | cut -d= -f2")
-    return {"unit": unit, "status": st, "pid": pid}
-
-def unit_restart(unit):
-    subprocess.call(["systemctl","restart",unit])
-    time.sleep(0.8)
-    return unit_status(unit)
-
-def logs_tail_text(unit, n=200):
-    n = max(10, min(int(n), 2000))
-    out = run(f'journalctl -u {unit} -n {n} --no-pager 2>&1')
-    return {"unit": unit, "lines": n, "text": out[-20000:]}
-
-def snapshot_now():
-    ts = datetime.now().strftime("%F_%H%M")
-    cmd = (
-      'tar czf "/root/snapshots/deniska_{ts}.tgz" '
-      '/root/projects/deniska-dashboard/deniska-dashboard.py '
-      '/etc/systemd/system/deniska-dashboard.service '
-      '/root/secrets/persobi_global_state.json '
-      '/etc/nginx/sites-available/deniska-dashboard.conf '
-      '/etc/nginx/deniska.htpasswd '
-      '/etc/nginx/conf.d/deniska-limits.conf '
-      '/etc/systemd/system/jurist.service '
-      '/etc/systemd/system/persobi.service 2>/dev/null || true'
-    ).format(ts=ts)
-    out = run(cmd)
-    return {"ok": True, "snapshot": f"/root/snapshots/deniska_{ts}.tgz", "out": out}
-
-def git_autosave():
-    if not os.path.exists("/root/bin/git-autosave.sh"):
-        return {"ok": False, "msg": "git-autosave.sh not found"}
-    out = run("/root/bin/git-autosave.sh 2>&1")
-    return {"ok": True, "out": out[-20000:]}
-
-def state_get():
-    try:
-        with open(MAP_FILE, "r") as f:
-            data = json.load(f)
-        return {"ok": True, "state": data}
-    except Exception as e:
-        return {"ok": False, "msg": str(e)}
-
-def state_set(payload):
-    new_state = payload.get("state")
-    if not isinstance(new_state, dict):
-        return {"ok": False, "msg": "state must be object"}
-    # сделаем бэкап
-    run(f'cp -a {MAP_FILE} {MAP_FILE}.bak.{datetime.now().strftime("%F_%H%M%S")}')
-    with open(MAP_FILE, "w") as f:
-        json.dump(new_state, f, ensure_ascii=False, indent=2)
-    return {"ok": True}
-
-ALLOWED_ACTIONS = {
-    "unit.status": lambda p: unit_status(p.get("unit","").strip()),
-    "unit.restart": lambda p: unit_restart(p.get("unit","").strip()),
-    "logs.tail": lambda p: logs_tail_text(p.get("unit","").strip(), p.get("n",200)),
-    "snapshot.now": lambda p: snapshot_now(),
-    "git.autosave": lambda p: git_autosave(),
-    "state.get": lambda p: state_get(),
-    "state.set": lambda p: state_set(p),
-}
-
-@app.post("/task")
-def task():
-    payload = request.get_json(force=True, silent=True) or {}
-    action = (payload.get("action") or "").strip()
-    if action not in ALLOWED_ACTIONS:
-        return jsonify({"ok": False, "msg": "action not allowed", "allowed": list(ALLOWED_ACTIONS.keys())}), 400
-    try:
-        res = ALLOWED_ACTIONS[action](payload)
-        return jsonify({"ok": True, "action": action, "result": res})
-    except Exception as e:
-        return jsonify({"ok": False, "action": action, "msg": str(e)}), 500
-
-# -------------------- HTML --------------------
+# --- HTML UI ---------------------------------------------------------------
 
 ROW = """  <tr>
   <td>{name}</td>
@@ -276,7 +199,6 @@ ROW = """  <tr>
     <button class="btn" onclick="doSync('{name}')">Sync</button>
     <a class="btn" href="/logs/{unit}" target="_blank">Logs</a>
     <a class="btn" href="/logs/stream/{unit}" target="_blank">Live</a>
-    <button class="btn" onclick="doTaskRestart('{unit}')">Restart</button>
   </td>
 </tr>
 """
@@ -287,6 +209,10 @@ def badge(status):
     return '<span class="b b-warn">⚠ not found</span>'
 
 def make_repo_cell(repo):
+    """
+    repo может быть str (URL) или dict со свойствами:
+    { "git": "...", "desc": "...", "name": "...", ... }
+    """
     try:
         if isinstance(repo, str):
             repo_name = repo.split("/")[-1] or repo
@@ -294,10 +220,13 @@ def make_repo_cell(repo):
         elif isinstance(repo, dict):
             text = repo.get("git") or repo.get("name") or "repo"
             desc = repo.get("desc", "")
+            # не гарантируем, что это URL — просто печатаем текст
+            safe = text
             if isinstance(text, str) and (text.startswith("http://") or text.startswith("https://")):
                 visible = text.split("/")[-1] or text
                 return f'<a href="{text}" target="_blank" title="{desc}">{visible}</a>'
-            return f'<span title="{desc}">{text}</span>'
+            # иначе просто плейнтекст с подсказкой
+            return f'<span title="{desc}">{safe}</span>'
         else:
             return '<span>—</span>'
     except Exception:
@@ -306,15 +235,16 @@ def make_repo_cell(repo):
 @app.get("/")
 def index():
     try:
-        rows_html = []
-        for r in load_map_rows():
-            rows_html.append(ROW.format(
+        rows_html_list = []
+        for r in projects_table():
+            repo_cell = make_repo_cell(r.get("repo"))
+            rows_html_list.append(ROW.format(
                 name=r.get("name","—"),
-                repo_cell=make_repo_cell(r.get("repo")),
+                repo_cell=repo_cell,
                 unit=r.get("unit","—"),
                 status_badge=badge(r.get("status","not-found"))
             ))
-        rows_html = "\n".join(rows_html)
+        rows_html = "\n".join(rows_html_list)
         t = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><title>Deniska Dashboard</title>
@@ -322,6 +252,7 @@ def index():
 <style>
 body{{background:#0b0b0e;color:#eaeaf0;font:16px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial}}
 h1{{display:flex;align-items:center;gap:.5rem}}
+h1 .icon{{filter:hue-rotate(70deg)}}
 .wrap{{max-width:1100px;margin:24px auto;padding:0 16px}}
 .table{{width:100%;border-collapse:collapse;margin-top:12px}}
 .table th,.table td{{padding:12px 10px;border-bottom:1px solid #24242a}}
@@ -346,15 +277,13 @@ input, .btn-compose{{border-radius:12px;border:1px solid #2a2f39;background:#0f1
 </head>
 <body>
 <div class="wrap">
-  <h1>🧩 Deniska Dashboard</h1>
+  <h1><span class="icon">🧩</span>Deniska Dashboard</h1>
   <div class="topline">
     <span id="meta">Сервер: {SERVER_NAME} | Обновлено: {t}</span>
     <span id="live">| CPU: <b id="cpu">…</b>% &nbsp; RAM: <b id="ram">…</b>% &nbsp; Uptime: <b id="uptime">…</b></span>
     <div class="spark" id="sparkCPU" title="CPU sparkline"></div>
     <div class="spark" id="sparkRAM" title="RAM sparkline"></div>
     <button class="btn" onclick="massPing()">Ping</button>
-    <button class="btn" onclick="doSnapshot()">Snapshot</button>
-    <button class="btn" onclick="doAutosave()">Autosave</button>
   </div>
 
   <table class="table">
@@ -424,28 +353,13 @@ async function compose(){{
   const j = await r.json();
   document.getElementById('composeOut').textContent = (j.msg||'').slice(-2000);
 }}
-
-async function doSnapshot(){{
-  const r = await fetch('/task', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{action:'snapshot.now'}})}});
-  const j = await r.json(); alert(JSON.stringify(j.result||j, null, 2));
-}}
-
-async function doAutosave(){{
-  const r = await fetch('/task', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{action:'git.autosave'}})}});
-  const j = await r.json(); alert((j.result && j.result.out ? j.result.out : JSON.stringify(j, null, 2)).slice(-2000));
-}}
-
-async function doTaskRestart(unit){{
-  const r = await fetch('/task', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{action:'unit.restart', unit}})}});
-  const j = await r.json(); alert(JSON.stringify(j.result||j, null, 2));
-}}
 </script>
 </body></html>
 """
     except Exception as e:
         return Response(f"<pre>Render error: {e}</pre>", mimetype="text/html; charset=utf-8"), 500
 
-# -------------------- app run --------------------
+# --- app run ---------------------------------------------------------------
 
 if __name__ == "__main__":
     app.run(host=HOST, port=PORT, debug=False)
