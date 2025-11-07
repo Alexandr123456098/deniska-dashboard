@@ -14,3 +14,13 @@ htmlcov/
 venv/
 .env
 .DS_Store
+*.so
+.pytest_cache/
+.env/
+out/
+*.log
+*.tgz
+*.zip
+*.jpg
+*.png
+*.mp4
