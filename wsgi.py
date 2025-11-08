@@ -1,81 +1,96 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Аварийный WSGI для Дениски.
-Логика:
-1) Пытаемся импортировать готовый Flask app:
-   - from deniska_dashboard import app
-   - import app (из app.py в корне проекта)
-2) Если не нашли — поднимаем минимальное приложение со /ping и /nano_index,
-   чтобы убрать 502 и дать панельке жить.
+WSGI-лоадер для Deniska Dashboard.
+1) Пытается загрузить Flask-приложение из файла deniska-dashboard.py (с дефисом в имени).
+2) Если не получилось — отдаёт минимальный фолбэк с /ping и /nano_index.
 """
 
 import os
 import json
-import pathlib
-from typing import List
+import types
+import importlib.util
+from pathlib import Path
+from flask import Flask, jsonify, Response
 
-app = None
+BASE = Path("/root/projects/deniska-dashboard").resolve()
+PRIMARY_FILE = BASE / "deniska-dashboard.py"   # ИМЕННО через дефис
+STATE_JSON = Path("/root/secrets/persobi_global_state.json")
 
-# 1) Попытки импорта «нормального» приложения
-try:
-    # Вариант: пакет проекта (рекомендовано для продакшена)
-    from deniska_dashboard import app as app  # type: ignore
-except Exception:
-    try:
-        # Вариант: файл app.py в корне проекта
-        import importlib
-        _app_mod = importlib.import_module("app")
-        app = getattr(_app_mod, "app", None)
-    except Exception:
-        app = None
+def _load_app_from_primary() -> Flask:
+    """
+    Загружает модуль из файла deniska-dashboard.py и достаёт из него объект Flask `app`.
+    """
+    if not PRIMARY_FILE.exists():
+        raise FileNotFoundError(f"Файл не найден: {PRIMARY_FILE}")
 
-# 2) Фолбэк — минимальное приложение
-if app is None:
-    from flask import Flask, jsonify
+    spec = importlib.util.spec_from_file_location("deniska_dashboard_dyn", str(PRIMARY_FILE))
+    if not spec or not spec.loader:
+        raise RuntimeError("Не удалось создать spec для deniska-dashboard.py")
 
-    app = Flask(__name__)
+    module = importlib.util.module_from_spec(spec)  # type: types.ModuleType
+    spec.loader.exec_module(module)                 # выполняем файл как модуль
+    candidate = getattr(module, "app", None)
+    if candidate is None or not isinstance(candidate, (Flask,)):
+        raise RuntimeError("В deniska-dashboard.py не найден Flask `app`")
+    return candidate
 
-    PROJECTS_ROOT = pathlib.Path("/root/projects")
-    STATE_PATH = pathlib.Path("/root/secrets/persobi_global_state.json")
-
-    def _nano_files() -> List[str]:
-        files: List[str] = []
-        if PROJECTS_ROOT.exists():
-            for p in PROJECTS_ROOT.glob("*/docs/NANO/*.md"):
-                try:
-                    files.append(str(p))
-                except Exception:
-                    pass
-        return sorted(files)
+def _fallback_app() -> Flask:
+    """
+    Мини-приложение на случай поломок основного.
+    Имеет /ping и /nano_index, чтобы nginx и проверки не падали.
+    """
+    app = Flask("deniska_fallback")
 
     @app.get("/ping")
     def ping():
-        return "pong", 200
+        return Response("pong", mimetype="text/plain; charset=utf-8")
 
     @app.get("/nano_index")
     def nano_index():
         data = {
             "ok": True,
-            "nano_files": _nano_files(),
-            "state_json_exists": STATE_PATH.exists(),
+            "state_json_exists": STATE_JSON.exists(),
+            "state_keys": [],
+            "nano_files": []
         }
-        # Опционально: вернуть верхние ключи карты проектов, если файл есть
-        if STATE_PATH.exists():
-            try:
-                with STATE_PATH.open("r", encoding="utf-8") as f:
-                    j = json.load(f)
+        try:
+            if STATE_JSON.exists():
+                j = json.loads(STATE_JSON.read_text(encoding="utf-8"))
                 if isinstance(j, dict):
-                    data["state_keys"] = sorted(list(j.keys()))
-            except Exception as e:
-                data["state_error"] = str(e)
-        return jsonify(data), 200
+                    data["state_keys"] = list(j.keys())
+        except Exception:
+            pass
+
+        # Поищем NANO-доки во всех проектах (как привыкли)
+        try:
+            roots = [
+                Path("/root/projects/deniska-dashboard"),
+                Path("/root/projects/jurist"),
+                Path("/root/projects/persobi-content"),
+                Path("/root/projects/testbot"),
+            ]
+            out = []
+            for r in roots:
+                p = r / "docs" / "NANO"
+                if p.exists():
+                    out += [str(x) for x in p.glob("*.md")]
+            data["nano_files"] = out
+        except Exception:
+            pass
+
+        return jsonify(data)
 
     @app.get("/")
-    def index():
-        return (
-            "Deniska fallback WSGI is alive. Endpoints: /ping, /nano_index",
-            200,
-        )
+    def root():
+        return Response("Deniska fallback WSGI is alive. Endpoints: /ping, /nano_index",
+                        mimetype="text/plain; charset=utf-8")
 
-# Важно для gunicorn: переменная app должна существовать
-assert app is not None, "WSGI app is not initialized"
+    return app
+
+# Пытаемся загрузить основное Flask-приложение
+try:
+    app: Flask = _load_app_from_primary()
+except Exception as e:
+    # Логически оставляем фолбэк — панель будет отвечать и через nginx
+    app = _fallback_app()
