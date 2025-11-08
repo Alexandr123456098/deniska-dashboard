@@ -1,32 +1,31 @@
+# secrets & env
+.env
+*.env
+
+# python noise
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.build/
-dist/
-build/
-.eggs/
-*.egg-info/
-.coverage
-htmlcov/
-.mypy_cache/
+
+# virtual envs
+venv/
 .venv/
-venv/
-.env
-.DS_Store
-*.so
-.pytest_cache/
-.env/
-out/
+env/
+
+# logs & tmp
 *.log
-*.tgz
-*.zip
-*.jpg
-*.png
-*.mp4
-venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pytest_cache/
-.DS_Store
+logs/
+tmp/
+cache/
+
+# data
+*.db
+*.sqlite*
+*.jsonl
+
+# media/downloads
+downloads/
+*.mp3
+*.ogg
+*.wav
