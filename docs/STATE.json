@@ -1,22 +1,22 @@
 {
-  "snapshot_at": "2025-11-12_021210",
+  "snapshot_at": "2025-11-12_022711",
   "host": "5238725-lq74514",
   "project": "deniska",
   "unit": "deniska-dashboard.service",
   "service_status": "active",
-  "git": { "branch": "main", "origin": "git@github.com:Alexandr123456098/deniska-dashboard.git", "dirty": "clean" },
+  "git": { "branch": "main", "origin": "git@github.com:Alexandr123456098/deniska-dashboard.git", "dirty": "dirty" },
   "system": { "disk_root": "36% used of 69G", "mem_used": "2.0Gi/5.8Gi" },
   "cluster": {
-  "at": "2025-11-12T02:12:11+03:00",
+  "at": "2025-11-12T02:27:11+03:00",
   "rows": [
     {
-      "name": "jurist",
-      "unit": "jurist.service",
-      "path": "/root/projects/jurist",
+      "name": "deniska",
+      "unit": "deniska-dashboard.service",
+      "path": "/root/projects/deniska-dashboard",
       "status": "Active",
       "branch": "main",
-      "origin": "git@github.com:Alexandr123456098/jurist-autosave.git",
-      "dirty": "-"
+      "origin": "git@github.com:Alexandr123456098/deniska-dashboard.git",
+      "dirty": "dirty"
     },
     {
       "name": "persobi",
@@ -28,30 +28,21 @@
       "dirty": "-"
     },
     {
-      "name": "deniska",
-      "unit": "deniska-dashboard.service",
-      "path": "/root/projects/deniska-dashboard",
-      "status": "Active",
-      "branch": "main",
-      "origin": "git@github.com:Alexandr123456098/deniska-dashboard.git",
-      "dirty": "-"
-    },
-    {
-      "name": "testbot",
-      "unit": "testbot.service",
-      "path": "/root/projects/testbot",
-      "status": "inactive",
-      "branch": "main",
-      "origin": "git@github.com:Alexandr123456098/testbot.git",
-      "dirty": "-"
-    },
-    {
       "name": "antishtraf",
       "unit": "antishtraf.service",
       "path": "/root/projects/antishtraf",
       "status": "Active",
       "branch": "main",
       "origin": "git@github.com:Alexandr123456098/antishtraf.git",
+      "dirty": "-"
+    },
+    {
+      "name": "jurist",
+      "unit": "jurist.service",
+      "path": "/root/projects/jurist",
+      "status": "Active",
+      "branch": "main",
+      "origin": "git@github.com:Alexandr123456098/jurist-autosave.git",
       "dirty": "-"
     }
   ]
