@@ -1,13 +1,13 @@
 {
-  "snapshot_at": "2025-11-12_015704",
+  "snapshot_at": "2025-11-12_021210",
   "host": "5238725-lq74514",
   "project": "deniska",
   "unit": "deniska-dashboard.service",
   "service_status": "active",
   "git": { "branch": "main", "origin": "git@github.com:Alexandr123456098/deniska-dashboard.git", "dirty": "clean" },
-  "system": { "disk_root": "36% used of 69G", "mem_used": "1.9Gi/5.8Gi" },
+  "system": { "disk_root": "36% used of 69G", "mem_used": "2.0Gi/5.8Gi" },
   "cluster": {
-  "at": "2025-11-12T01:57:05+03:00",
+  "at": "2025-11-12T02:12:11+03:00",
   "rows": [
     {
       "name": "jurist",
