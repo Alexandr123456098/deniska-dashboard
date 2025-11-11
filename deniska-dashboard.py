@@ -10,11 +10,11 @@ app = Flask(__name__)
 
 # Карта известных репозиториев/проектов (расширяемая)
 REPOS = [
-    {"name": "jurist",   "unit": "jurist.service",            "path": "/root/projects/jurist"},
-    {"name": "persobi",  "unit": "persobi.service",           "path": "/root/projects/persobi-content"},
     {"name": "deniska",  "unit": "deniska-dashboard.service", "path": "/root/projects/deniska-dashboard"},
-    {"name": "testbot",  "unit": "testbot.service",           "path": "/root/projects/testbot"},   
-    {"name": "antishtraf","unit": "antishtraf.service",       "path": "/root/projects/antishtraf"},
+    {"name": "persobi",  "unit": "persobi.service",           "path": "/root/projects/persobi-content"},
+    {"name": "antishtraf","unit": "antishtraf.service",        "path": "/root/projects/antishtraf"},
+    {"name": "jurist",   "unit": "jurist.service",            "path": "/root/projects/jurist"},
+    {"name": "testbot",  "unit": "testbot.service",           "path": "/root/projects/testbot"},
 ]
 
 PASSPORT_FILE = "/root/docs/DENISKA_PASSPORT.md"
