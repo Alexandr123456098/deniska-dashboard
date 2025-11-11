@@ -1,13 +1,13 @@
 {
-  "snapshot_at": "2025-11-12_024211",
+  "snapshot_at": "2025-11-12_025712",
   "host": "5238725-lq74514",
   "project": "deniska",
   "unit": "deniska-dashboard.service",
   "service_status": "active",
   "git": { "branch": "main", "origin": "git@github.com:Alexandr123456098/deniska-dashboard.git", "dirty": "clean" },
-  "system": { "disk_root": "36% used of 69G", "mem_used": "1.9Gi/5.8Gi" },
+  "system": { "disk_root": "36% used of 69G", "mem_used": "2.0Gi/5.8Gi" },
   "cluster": {
-  "at": "2025-11-12T02:42:11+03:00",
+  "at": "2025-11-12T02:57:12+03:00",
   "rows": [
     {
       "name": "deniska",
@@ -22,7 +22,7 @@
       "name": "persobi",
       "unit": "persobi.service",
       "path": "/root/projects/persobi-content",
-      "status": "Active",
+      "status": "inactive",
       "branch": "-",
       "origin": "-",
       "dirty": "-"
