@@ -110,7 +110,7 @@ def metrics_series():
 def projects_table():
     data = load_map()
     rows = []
-    # допускаем формат: { "jurist": "user/jurist-autosave.git", "persobi": "user/persobi-content.git", ... }
+    # допускаем формат: { "jurist": "user/jurist-autosave.git", "persobi-content": "user/persobi-content.git", ... }
     for name, repo in data.items():
         unit = f"{name}.service"
         status = sysd_active(unit)

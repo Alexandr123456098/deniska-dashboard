@@ -67,8 +67,8 @@ def _fallback_app() -> Flask:
             roots = [
                 Path("/root/projects/deniska-dashboard"),
                 Path("/root/projects/jurist"),
-                Path("/root/projects/persobi-content"),
-                Path("/root/projects/testbot"),
+                Path("/opt/content_factory"),
+                Path("/root/projects/"),
             ]
             out = []
             for r in roots:
