@@ -29,3 +29,7 @@ downloads/
 *.mp3
 *.ogg
 *.wav
+
+# auto-generated docs
+docs/STATE.json
+docs/NANO/PASSPORT_LATEST.md
