@@ -10,10 +10,10 @@ app = Flask(__name__)
 
 # Карта известных репозиториев/проектов (расширяемая)
 REPOS = [
-    {"name": "deniska",  "unit": "deniska-dashboard.service", "path": "/root/projects/deniska-dashboard"},
-    {"name": "persobi-content",  "unit": "content-factory.service",           "path": "/opt/content_factory"},
-    {"name": "antishtraf","unit": "antishtraf.service",        "path": "/root/projects/antishtraf"},
-    {"name": "jurist",   "unit": "jurist.service",            "path": "/root/projects/jurist"},
+    {"name": "deniska",          "unit": "deniska-dashboard.service", "path": "/root/projects/deniska-dashboard"},
+    {"name": "persobi-content",  "unit": "content-factory.service",   "path": "/opt/content_factory"},
+    {"name": "netshtrafa",       "unit": "netshtrafa.service",        "path": "/root/projects/netshtrafa"},
+    {"name": "jurist",           "unit": "jurist.service",            "path": "/root/projects/jurist"},
 ]
 
 PASSPORT_FILE = "/root/docs/DENISKA_PASSPORT.md"
@@ -307,7 +307,7 @@ NANO_HTML = """<!doctype html>
  </div>
  <div id="root"></div>
 <script>
- function esc(s){return (s||'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+ function esc(s){return (s||'').toString().replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'gt;'}[c]))}
  async function fetchJSON(url){ const r=await fetch(url,{cache:'no-store'}); if(!r.ok) throw new Error('HTTP '+r.status); return await r.json(); }
  function formatTS(ts){ try{ const d=new Date(ts*1000); return d.toLocaleString(); }catch(_){ return '-'; } }
  async function load(){
