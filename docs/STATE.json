@@ -1,15 +1,15 @@
 {
-  "snapshot_at": "2025-11-12_133054",
+  "snapshot_at": "2025-11-12_134603",
   "host": "5238725-lq74514",
   "project": "deniska",
   "unit": "deniska-dashboard.service",
   "service_status": "active",
   "git": { "branch": "main", "origin": "git@github.com:Alexandr123456098/deniska-dashboard.git", "dirty": "clean" },
-  "system": { "disk_root": "37% used of 69G", "mem_used": "1.9Gi/5.8Gi" },
+  "system": { "disk_root": "37% used of 69G", "mem_used": "2.0Gi/5.8Gi" },
   "cluster": { "rows": [
-  {"name":"deniska","unit":"deniska-dashboard.service","path":"/root/projects/deniska-dashboard","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/deniska-dashboard.git","dirty":"clean","uptime":"28002"},
-  {"name":"persobi-content","unit":"content-factory.service","path":"/opt/content_factory","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/persobi-content.git","dirty":"clean","uptime":"42554"},
-  {"name":"antishtraf","unit":"antishtraf.service","path":"/root/projects/antishtraf","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/antishtraf.git","dirty":"clean","uptime":"46957"},
-  {"name":"jurist","unit":"jurist.service","path":"/root/projects/jurist","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/jurist-autosave.git","dirty":"clean","uptime":"383158"}
+  {"name":"deniska","unit":"deniska-dashboard.service","path":"/root/projects/deniska-dashboard","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/deniska-dashboard.git","dirty":"clean","uptime":"28911"},
+  {"name":"persobi-content","unit":"content-factory.service","path":"/opt/content_factory","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/persobi-content.git","dirty":"clean","uptime":"43462"},
+  {"name":"antishtraf","unit":"antishtraf.service","path":"/root/projects/antishtraf","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/antishtraf.git","dirty":"clean","uptime":"47866"},
+  {"name":"jurist","unit":"jurist.service","path":"/root/projects/jurist","status":"Active","branch":"main","origin":"git@github.com:Alexandr123456098/jurist-autosave.git","dirty":"clean","uptime":"384066"}
 ]}
 }
