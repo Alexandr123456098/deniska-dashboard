@@ -44,7 +44,7 @@ def read_state_files():
 def collect_status_quick():
     # Пытаемся взять готовый JSON от скрипта, иначе — STATE.json
     try:
-        cp = run("bash /root/bin/deniska-status.sh", timeout=3.0)
+        cp = run("bash /root/bin/deniska-status.sh", timeout=6.0)
         if cp.returncode == 0:
             data = json.loads(cp.stdout.strip())
             rows = data.get("rows") or []
